@@ -10,6 +10,27 @@ from sklearn.gaussian_process.kernels import Matern
 from sklearn.gaussian_process import GaussianProcessRegressor
 
 
+class Matern2(Matern):
+    def __init__(
+        self,
+        length_scale=1.0,
+        length_scale_bounds=(1e-5, 1e5),
+        nu=1.5,
+        discrete=None,
+    ):
+        super().__init__(length_scale, length_scale_bounds, nu)
+        self.nu = nu
+        self.discrete = discrete
+        self.m = Matern(nu=nu)
+
+    def __call__(self, X, Y=None, eval_gradient=False):
+        for x in X:
+            for i in range(len(x)):
+                if self.discrete[i] == 1:
+                    x[i] = round(x[i])
+        return self.m(X, Y, eval_gradient)
+
+
 class Queue:
     def __init__(self):
         self._queue = []
@@ -42,6 +63,7 @@ class Observable(object):
     Inspired/Taken from
         https://www.protechtraining.com/blog/post/879#simple-observer
     """
+
     def __init__(self, events):
         # maps event names to subscribers
         # str -> dict
@@ -52,7 +74,7 @@ class Observable(object):
 
     def subscribe(self, event, subscriber, callback=None):
         if callback == None:
-            callback = getattr(subscriber, 'update')
+            callback = getattr(subscriber, "update")
         self.get_subscribers(event)[subscriber] = callback
 
     def unsubscribe(self, event, subscriber):
@@ -64,8 +86,11 @@ class Observable(object):
 
 
 class BayesianOptimization(Observable):
-    def __init__(self, f, pbounds, random_state=None, verbose=2):
+    def __init__(
+        self, f, pbounds, random_state=None, verbose=2, discrete=None
+    ):
         """"""
+
         self._random_state = ensure_rng(random_state)
 
         # Data structure containing the function to be optimized, the bounds of
@@ -77,7 +102,7 @@ class BayesianOptimization(Observable):
 
         # Internal GP regressor
         self._gp = GaussianProcessRegressor(
-            kernel=Matern(nu=2.5),
+            kernel=Matern2(nu=2.5, discrete=discrete),
             alpha=1e-6,
             normalize_y=True,
             n_restarts_optimizer=5,
@@ -129,7 +154,7 @@ class BayesianOptimization(Observable):
             gp=self._gp,
             y_max=self._space.target.max(),
             bounds=self._space.bounds,
-            random_state=self._random_state
+            random_state=self._random_state,
         )
 
         return self._space.array_to_params(suggestion)
@@ -149,13 +174,15 @@ class BayesianOptimization(Observable):
             self.subscribe(Events.OPTMIZATION_STEP, _logger)
             self.subscribe(Events.OPTMIZATION_END, _logger)
 
-    def maximize(self,
-                 init_points=5,
-                 n_iter=25,
-                 acq='ucb',
-                 kappa=2.576,
-                 xi=0.0,
-                 **gp_params):
+    def maximize(
+        self,
+        init_points=5,
+        n_iter=25,
+        acq="ucb",
+        kappa=2.576,
+        xi=0.0,
+        **gp_params
+    ):
         """Mazimize your function"""
         self._prime_subscriptions()
         self.dispatch(Events.OPTMIZATION_START)
