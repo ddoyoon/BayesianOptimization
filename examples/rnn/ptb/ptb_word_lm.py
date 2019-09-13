@@ -79,8 +79,11 @@ flags = tf.flags
 logging = tf.logging
 logging.set_verbosity(tf.logging.FATAL)
 
+tf.set_random_seed(1234)
+
 # Hacky, removing contrib warning for prettier printing
-if type(tf.contrib) != type(tf): tf.contrib._warning = None
+if type(tf.contrib) != type(tf):
+    tf.contrib._warning = None
 
 flags.DEFINE_string(
     "model",
@@ -109,6 +112,11 @@ flags.DEFINE_string(
     "and lstm_block_cell classes.",
 )
 flags.DEFINE_bool("verbose", False, "Verbose output of training")
+flags.DEFINE_string(
+    "strategy",
+    "proposed",
+    "Strategy for discretizing. Possible options are: basic, proposed",
+)
 FLAGS = flags.FLAGS
 BASIC = "basic"
 CUDNN = "cudnn"
@@ -505,7 +513,7 @@ def get_config():
     return config
 
 
-def train_and_validate(batch_size, learning_rate):
+def train_and_validate(batch_size, learning_rate_01, learning_rate_10):
     if not FLAGS.data_path:
         raise ValueError("Must set --data_path to PTB data directory")
     gpus = [
@@ -526,8 +534,15 @@ def train_and_validate(batch_size, learning_rate):
     config = get_config()
 
     # Modify default model configuration with input hyperparameters
-    config.batch_size = int(batch_size)
-    config.learning_rate = learning_rate
+    # Proposed strategy will input discretized/integer value as float so casting to int is needed
+    # Basic strategy will input a float value
+    config.batch_size = int(round(batch_size))
+    # config.learning_rate = learning_rate
+    # For categorical parameters, use one-hot encoding to set config
+    if learning_rate_01 == 1:
+        config.learning_rate = 0.1
+    elif learning_rate_10 == 1:
+        config.learning_rate = 1.0
 
     eval_config = get_config()
     eval_config.batch_size = 1
@@ -637,35 +652,55 @@ def train_and_validate(batch_size, learning_rate):
     return -valid_perplexity
 
 
-def get_discrete_idx(pbounds, discrete_names):
+def get_idx(pbounds, names):
     param_names = list(pbounds.keys())
     param_names.sort()
 
-    discrete_list = [0] * len(param_names)
+    param_list = [0] * len(param_names)
     for i in range(len(param_names)):
-        if param_names[i] in discrete_names:
-            discrete_list[i] = 1
+        if param_names[i] in names:
+            param_list[i] = 1
 
-    return discrete_list
+    return param_list
 
 
 def main():
-    pbounds = {"batch_size": (10, 80), "learning_rate": (0.1, 2.0)}
+    # pbounds = {"batch_size": (10, 80), "learning_rate": (0.1, 2.0)}
+    pbounds = {
+        "batch_size": (10, 80),
+        "learning_rate_01": (0, 1),
+        "learning_rate_10": (0, 1),
+    }
     discrete = ["batch_size"]
+    # TODO: support multiple categorical parameters
+    categorical = ["learning_rate_01", "learning_rate_10"]
 
-    discrete_indices = get_discrete_idx(pbounds, discrete)
+    discrete_indices = get_idx(pbounds, discrete)
+    categorical_indices = get_idx(pbounds, categorical)
 
     optimizer = BayesianOptimization(
+        strategy=FLAGS.strategy,
         f=train_and_validate,
         pbounds=pbounds,
         verbose=2,  # verbose = 1 prints only when a maximum is observed, verbose = 0 is silent
         random_state=1,  # Optional, BO 에서 randomness 통제하기 위해 seed 입력 가능
         discrete=discrete_indices,
+        categorical=categorical_indices,
     )
 
     # TODO: points trained with init_points are not discretized as of now.
     #       Explicitly probing initial points with discrete values
-    optimizer.probe(params={"batch_size": 20, "learning_rate": 1.0}, lazy=True)
+    # optimizer.probe(params={"batch_size": 20, "learning_rate": 1.0}, lazy=True)
+    # optimizer.probe(params={"batch_size": 20, "learning_rate": 0.1}, lazy=True)
+    optimizer.probe(
+        params={
+            "batch_size": 20,
+            "learning_rate_10": 1,
+            "learning_rate_01": 0,
+        },
+        lazy=True,
+    )
+
     optimizer.maximize(init_points=0, n_iter=10)
 
 
