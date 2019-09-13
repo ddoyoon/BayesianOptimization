@@ -27,7 +27,6 @@ class Matern2(Matern):
 
     def __call__(self, X, Y=None, eval_gradient=False):
         category = {}
-        print(X)
         for x in X:
             for i in range(len(x)):
                 if self.discrete[i] == 1:
@@ -41,7 +40,6 @@ class Matern2(Matern):
                 x[i] = 0
             else:
                 x[i] = 1
-        print(X)
         return self.m(X, Y, eval_gradient)
 
 
