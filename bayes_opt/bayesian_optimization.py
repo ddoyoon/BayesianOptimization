@@ -17,17 +17,31 @@ class Matern2(Matern):
         length_scale_bounds=(1e-5, 1e5),
         nu=1.5,
         discrete=None,
+        categorical=None,
     ):
         super().__init__(length_scale, length_scale_bounds, nu)
         self.nu = nu
         self.discrete = discrete
+        self.categorical = categorical
         self.m = Matern(nu=nu)
 
     def __call__(self, X, Y=None, eval_gradient=False):
+        category = {}
+        print(X)
         for x in X:
             for i in range(len(x)):
                 if self.discrete[i] == 1:
                     x[i] = round(x[i])
+                elif self.categorical[i] == 1:
+                    category[i] = x[i]
+        # One-hot encode category
+        key_max = max(category.keys(), key=(lambda k: category[k]))
+        for i in category.keys():
+            if i != key_max:
+                x[i] = 0
+            else:
+                x[i] = 1
+        print(X)
         return self.m(X, Y, eval_gradient)
 
 
@@ -87,10 +101,16 @@ class Observable(object):
 
 class BayesianOptimization(Observable):
     def __init__(
-        self, f, pbounds, random_state=None, verbose=2, discrete=None
+        self,
+        strategy,
+        f,
+        pbounds,
+        random_state=None,
+        verbose=2,
+        discrete=None,
+        categorical=None,
     ):
         """"""
-
         self._random_state = ensure_rng(random_state)
 
         # Data structure containing the function to be optimized, the bounds of
@@ -101,13 +121,24 @@ class BayesianOptimization(Observable):
         self._queue = Queue()
 
         # Internal GP regressor
-        self._gp = GaussianProcessRegressor(
-            kernel=Matern2(nu=2.5, discrete=discrete),
-            alpha=1e-6,
-            normalize_y=True,
-            n_restarts_optimizer=5,
-            random_state=self._random_state,
-        )
+        if strategy == "basic":
+            self._gp = GaussianProcessRegressor(
+                kernel=Matern(nu=2.5),
+                alpha=1e-6,
+                normalize_y=True,
+                n_restarts_optimizer=5,
+                random_state=self._random_state,
+            )
+        elif strategy == "proposed":
+            self._gp = GaussianProcessRegressor(
+                kernel=Matern2(
+                    nu=2.5, discrete=discrete, categorical=categorical
+                ),
+                alpha=1e-6,
+                normalize_y=True,
+                n_restarts_optimizer=5,
+                random_state=self._random_state,
+            )
 
         self._verbose = verbose
         super(BayesianOptimization, self).__init__(events=DEFAULT_EVENTS)
