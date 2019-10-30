@@ -72,6 +72,7 @@ import util
 
 from tensorflow.python.client import device_lib
 from bayes_opt import BayesianOptimization
+from bayes_opt import UtilityFunction
 
 from distutils.version import StrictVersion
 
@@ -513,7 +514,12 @@ def get_config():
     return config
 
 
-def train_and_validate(batch_size, learning_rate_01, learning_rate_10):
+# TODO: add wrapper
+
+
+def train_and_validate(
+    batch_size_20, batch_size_40, batch_size_60, batch_size_80, learning_rate
+):
     if not FLAGS.data_path:
         raise ValueError("Must set --data_path to PTB data directory")
     gpus = [
@@ -536,18 +542,31 @@ def train_and_validate(batch_size, learning_rate_01, learning_rate_10):
     # Modify default model configuration with input hyperparameters
     # Proposed strategy will input discretized/integer value as float so casting to int is needed
     # Basic strategy will input a float value
-    config.batch_size = int(round(batch_size))
-    # config.learning_rate = learning_rate
+    # config.batch_size = int(round(batch_size))
+    config.learning_rate = learning_rate
     # For categorical parameters, use one-hot encoding to set config
-    if learning_rate_01 == 1:
-        config.learning_rate = 0.1
-    elif learning_rate_10 == 1:
-        config.learning_rate = 1.0
-
+    batch_size_list = [
+        batch_size_20,
+        batch_size_40,
+        batch_size_60,
+        batch_size_80,
+    ]
+    batch_size_idx = batch_size_list.index(max(batch_size_list))
+    config.batch_size = 20 * (batch_size_idx + 1)
+    # if batch_size_20 == 1:
+    #     config.batch_size = 20
+    # elif batch_size_40 == 1:
+    #     config.batch_size = 40
+    # elif batch_size_60 == 1:
+    #     config.batch_size = 60
+    # elif batch_size_80 == 1:
+    #     config.batch_size = 80
+    # else:
+    #     raise Exception("Categorical parameter is not properly one-hot encoded")
     eval_config = get_config()
     eval_config.batch_size = 1
     eval_config.num_steps = 1
-
+    print("lr=%s bs=%s" % (config.learning_rate, config.batch_size))
     with tf.Graph().as_default():
         initializer = tf.random_uniform_initializer(
             -config.init_scale, config.init_scale
@@ -667,13 +686,22 @@ def get_idx(pbounds, names):
 def main():
     # pbounds = {"batch_size": (10, 80), "learning_rate": (0.1, 2.0)}
     pbounds = {
-        "batch_size": (10, 80),
-        "learning_rate_01": (0, 1),
-        "learning_rate_10": (0, 1),
+        "batch_size_20": (0, 1),
+        "batch_size_40": (0, 1),
+        "batch_size_60": (0, 1),
+        "batch_size_80": (0, 1),
+        "learning_rate": (0.1, 2.0),
     }
-    discrete = ["batch_size"]
+
+    discrete = []
     # TODO: support multiple categorical parameters
-    categorical = ["learning_rate_01", "learning_rate_10"]
+    # Parameter type 과 가능한 값들을 입력으로 받아서 직접 generate
+    categorical = [
+        "batch_size_20",
+        "batch_size_40",
+        "batch_size_60",
+        "batch_size_80",
+    ]
 
     discrete_indices = get_idx(pbounds, discrete)
     categorical_indices = get_idx(pbounds, categorical)
@@ -692,16 +720,22 @@ def main():
     #       Explicitly probing initial points with discrete values
     # optimizer.probe(params={"batch_size": 20, "learning_rate": 1.0}, lazy=True)
     # optimizer.probe(params={"batch_size": 20, "learning_rate": 0.1}, lazy=True)
+
     optimizer.probe(
         params={
-            "batch_size": 20,
-            "learning_rate_10": 1,
-            "learning_rate_01": 0,
+            "batch_size_20": 1,
+            "batch_size_40": 0,
+            "batch_size_60": 0,
+            "batch_size_80": 0,
+            "learning_rate": 1.0,
         },
-        lazy=True,
+        lazy=False,
     )
+    utility = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
+    next_point_to_probe = optimizer.suggest(utility)
+    print("Next point to probe is:", next_point_to_probe)
 
-    optimizer.maximize(init_points=0, n_iter=10)
+    # optimizer.maximize(init_points=0, n_iter=10)
 
 
 if __name__ == "__main__":
