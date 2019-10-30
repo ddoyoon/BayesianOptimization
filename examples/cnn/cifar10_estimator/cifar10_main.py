@@ -637,7 +637,7 @@ def main(
         batch_size = 2 ** (batch_idx + 4)
         # print(f"[batch size] {batch_sizes} -> bs = {batch_size}")
 
-        hparams["batch_size"] = batch_size
+        hparams["train_batch_size"] = batch_size
         hparams["learning_rate"] = learning_rate
 
         # Create separate directory for each trial
