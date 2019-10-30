@@ -14,7 +14,7 @@ from tensorflow.contrib.learn.python.learn import run_config
 
 
 # TODO(b/64848083) Remove once uid bug is fixed
-class RunConfig(tf.contrib.learn.RunConfig): 
+class RunConfig(tf.estimator.RunConfig):
   def uid(self, whitelist=None):
     """Generates a 'Unique Identifier' based on all internal fields.
     Caller should use the uid string to check `RunConfig` instance integrity
@@ -45,7 +45,7 @@ class RunConfig(tf.contrib.learn.RunConfig):
                 key=lambda t: t[0])
       )
     return ', '.join(
-        '%s=%r' % (k, v) for (k, v) in six.iteritems(ordered_state)) 
+        '%s=%r' % (k, v) for (k, v) in six.iteritems(ordered_state))
 
 
 class ExamplesPerSecondHook(session_run_hook.SessionRunHook):

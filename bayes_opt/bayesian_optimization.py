@@ -20,6 +20,7 @@ class Matern2(Matern):
         discrete=None,
         categorical=None,
     ):
+        # print("Using custom kernel.")
         super().__init__(length_scale, length_scale_bounds, nu)
         self.nu = nu
         self.discrete = discrete
@@ -147,6 +148,8 @@ class BayesianOptimization(Observable):
             )
 
         self._verbose = verbose
+        self.discrete = discrete
+        self.categorical = categorical
         super(BayesianOptimization, self).__init__(events=DEFAULT_EVENTS)
 
     @property
@@ -177,6 +180,7 @@ class BayesianOptimization(Observable):
     def suggest(self, utility_function):
         """Most promissing point to probe next"""
         if len(self._space) == 0:
+            # TODO: Fix here to make init points discrete as well
             return self._space.array_to_params(self._space.random_sample())
 
         # Sklearn's GP throws a large number of warnings at times, but

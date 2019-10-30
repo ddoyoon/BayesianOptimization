@@ -47,9 +47,14 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 
 import tensorflow as tf
 
+import ray
+from ray.tune import run
+from ray.tune.schedulers import AsyncHyperBandScheduler
+from ray.tune.suggest.bayesopt import BayesOptSearch
+
 logging = tf.logging
 # Setting verbosity to INFO will log training and evaluation details.
-logging.set_verbosity(tf.logging.FATAL)
+logging.set_verbosity(tf.logging.ERROR)
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -89,30 +94,30 @@ parser.add_argument(
     default=80000,
     help="The number of steps to use for training.",
 )
-parser.add_argument(
-    "--train-batch-size",
-    type=int,
-    default=128,
-    help="Batch size for training.",
-)
+# parser.add_argument(
+#     "--train-batch-size",
+#     type=int,
+#     default=128,
+#     help="Batch size for training.",
+# )
 parser.add_argument(
     "--eval-batch-size",
     type=int,
     default=100,
     help="Batch size for validation.",
 )
-parser.add_argument(
-    "--momentum",
-    type=float,
-    default=0.9,
-    help="Momentum for MomentumOptimizer.",
-)
-parser.add_argument(
-    "--weight-decay",
-    type=float,
-    default=2e-4,
-    help="Weight decay for convolutions.",
-)
+# parser.add_argument(
+#     "--momentum",
+#     type=float,
+#     default=0.9,
+#     help="Momentum for MomentumOptimizer.",
+# )
+# parser.add_argument(
+#     "--weight-decay",
+#     type=float,
+#     default=2e-4,
+#     help="Weight decay for convolutions.",
+# )
 # parser.add_argument(
 #     "--learning-rate",
 #     type=float,
@@ -171,18 +176,18 @@ parser.add_argument(
     default=False,
     help="Whether to log device placement.",
 )
-parser.add_argument(
-    "--batch-norm-decay",
-    type=float,
-    default=0.997,
-    help="Decay for batch norm.",
-)
-parser.add_argument(
-    "--batch-norm-epsilon",
-    type=float,
-    default=1e-5,
-    help="Epsilon for batch norm.",
-)
+# parser.add_argument(
+#     "--batch-norm-decay",
+#     type=float,
+#     default=0.997,
+#     help="Decay for batch norm.",
+# )
+# parser.add_argument(
+#     "--batch-norm-epsilon",
+#     type=float,
+#     default=1e-5,
+#     help="Epsilon for batch norm.",
+# )
 
 # Add arguments related to BayesOpt
 
@@ -210,6 +215,14 @@ parser.add_argument(
     default="accuracy",
     help="""\
     Whether to use accuracy or loss for Bayesian optimization.\
+    """,
+)
+
+parser.add_argument(
+    "--ray-address",
+    type=str,
+    default="localhost:6379",
+    help="""
     """,
 )
 
@@ -595,6 +608,7 @@ def get_idx(pbounds, names):
 
     return param_list
 
+
 # TODO: categorical 로 overlap 보기보다 discrete 로 여러가지 hp 보는 것으로, elsa 6, 8, 10
 def main(
     strategy,
@@ -609,14 +623,7 @@ def main(
     num_intra_threads,
     **hparams,
 ):
-    def discretize_train(
-        batch_size_16,
-        batch_size_32,
-        batch_size_64,
-        batch_size_128,
-        batch_size_256,
-        learning_rate,
-    ):
+    def discretize_train(config, reporter):
         """Wrapper for handling discrete or categorical variables.
         The suggested values to try are casted and calculated here and passed to the actual training routine.
 
@@ -626,32 +633,35 @@ def main(
 
         Returns the metric returned by the training routine to use as feedback to Bayesian Optimization.
         """
-        batch_sizes = [
-            batch_size_16,
-            batch_size_32,
-            batch_size_64,
-            batch_size_128,
-            batch_size_256,
-        ]
-        batch_idx = np.argmax(batch_sizes)
-        batch_size = 2 ** (batch_idx + 4)
-        # print(f"[batch size] {batch_sizes} -> bs = {batch_size}")
+        # Convert to actual hyperparameter values here using the grid (discrete) input
+        hparams["train_batch_size"] = 28 + int(config["batch_size"])
+        hparams["momentum"] = 0.4 + (0.55 * config["momentum"] / 100)
+        hparams["weight_decay"] = 1e-4 + (1e-4 * config["weight_decay"] / 100)
+        hparams["batch_norm_decay"] = 0.8 + (
+            0.199 * config["batch_norm_decay"] / 100
+        )
+        hparams["batch_norm_epsilon"] = 1e-5 + (
+            0.00099 * config["batch_norm_epsilon"] / 100
+        )
+        hparams["learning_rate"] = 0.01 + (0.1 * config["learning_rate"] / 100)
 
-        hparams["train_batch_size"] = batch_size
-        hparams["learning_rate"] = learning_rate
+        # print(config)
+        # print(hparams)
 
         # Create separate directory for each trial
         hp = [
-            batch_size_16,
-            batch_size_32,
-            batch_size_64,
-            batch_size_128,
-            batch_size_256,
-            learning_rate,
+            config["batch_size"],
+            config["momentum"],
+            config["weight_decay"],
+            config["batch_norm_decay"],
+            config["batch_norm_epsilon"],
+            config["learning_rate"],
         ]
         hp_id = "-".join(map(str, hp))
         config = cifar10_utils.RunConfig(
-            session_config=sess_config, model_dir=job_dir + "/" + hp_id
+            session_config=sess_config,
+            model_dir=None
+            # session_config=sess_config, model_dir=job_dir + "/" + hp_id
         )
 
         # res: A tuple of the result of the evaluate call to the Estimator and the export results using the specified ExportStrategy
@@ -670,7 +680,7 @@ def main(
         )
 
         if metric == "accuracy":
-            return res[0]["accuracy"]
+            reporter(done=1, train_acc=res[0]["accuracy"])
         elif metric == "loss":
             # Bayesian Optimization seeks to maximize, so return negative of loss
             return -res[0]["loss"]
@@ -689,95 +699,88 @@ def main(
         ),
     )
 
-    # config = cifar10_utils.RunConfig(
-    #     session_config=sess_config, model_dir=job_dir
-    # )
-
     if test:
         print("Testing with 100 steps")
         hparams["train_steps"] = 100
 
+    # Minor hack of generating a grid of 100 values each.
+    # By setting all parameters to be discrete values over range (0,100),
+    # we can map each integer value to corresponding hyperparameter value in training code.
     pbounds = {
-        "batch_size_16": (0, 1),
-        "batch_size_32": (0, 1),
-        "batch_size_64": (0, 1),
-        "batch_size_128": (0, 1),
-        "batch_size_256": (0, 1),
-        "learning_rate": (0.001, 0.1),
+        "batch_size": (0, 100),
+        "momentum": (0, 100),
+        "weight_decay": (0, 100),
+        "batch_norm_decay": (0, 100),
+        "batch_norm_epsilon": (0, 100),
+        "learning_rate": (0, 100),
     }
 
-    discrete = []
-    # TODO: support multiple categorical parameters
-    #       Parameter name 과 가능한 값들을 입력으로 받아서 직접 generate?
-    categorical = [
-        "batch_size_16",
-        "batch_size_32",
-        "batch_size_64",
-        "batch_size_128",
-        "batch_size_256",
+    discrete = [
+        "batch_size",
+        "momentum",
+        "weight_decay",
+        "batch_norm_decay",
+        "batch_norm_epsilon",
+        "learning_rate",
     ]
+
+    categorical = []
 
     discrete_indices = get_idx(pbounds, discrete)
     categorical_indices = get_idx(pbounds, categorical)
 
-    optimizer = BayesianOptimization(
-        strategy=strategy,
-        f=discretize_train,
-        pbounds=pbounds,
-        verbose=2,  # verbose = 1 prints only when a maximum is observed, verbose = 0 is silent
-        random_state=1,  # Optional, BO 에서 randomness 통제하기 위해 seed 입력 가능
+    config = {
+        "num_samples": 10,
+        "config": {"iterations": 100},
+        "stop": {"done": 1},
+    }
+
+    algo = BayesOptSearch(
+        strategy,
+        pbounds,
         discrete=discrete_indices,
         categorical=categorical_indices,
+        max_concurrent=1,
+        metric="train_acc",
+        mode="max",
+        utility_kwargs={"kind": "ucb", "kappa": 2.5, "xi": 0.0},
     )
 
-    # # TODO: points trained with init_points are not discretized as of now.
-    # #       Explicitly probing initial points with discrete values
-    optimizer.probe(
-        params={
-            "batch_size_16": 0,
-            "batch_size_32": 1,
-            "batch_size_64": 0,
-            "batch_size_128": 0,
-            "batch_size_256": 0,
-            "learning_rate": 0.001,
-        },
-        lazy=True,
-    )
+    # TODO: Initial values will not be discretized as of now.
+    #       Manually probing with discrete values instead.
+    # algo.optimizer.probe(
+    #     params={
+    #         "batch_size": 0,
+    #         "momentum": 0,
+    #         "weight_decay": 0,
+    #         "batch_norm_decay": 0,
+    #         "batch_norm_epsilon": 0,
+    #         "learning_rate": 0,
+    #     },
+    #     lazy=True,
+    # )
 
-    optimizer.probe(
-        params={
-            "batch_size_16": 0,
-            "batch_size_32": 1,
-            "batch_size_64": 0,
-            "batch_size_128": 0,
-            "batch_size_256": 0,
-            "learning_rate": 0.01,
-        },
-        lazy=True,
-    )
-
-    optimizer.probe(
-        params={
-            "batch_size_16": 0,
-            "batch_size_32": 1,
-            "batch_size_64": 0,
-            "batch_size_128": 0,
-            "batch_size_256": 0,
-            "learning_rate": 0.1,
-        },
-        lazy=True,
+    scheduler = AsyncHyperBandScheduler(metric="train_acc", mode="max")
+    run(
+        discretize_train,
+        name="my_exp",
+        search_alg=algo,
+        scheduler=scheduler,
+        resources_per_trial={"cpu": 12, "gpu": 1},
+        **config,
     )
 
     # utility = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
     # next_point_to_probe = optimizer.suggest(utility)
     # print("Next point to probe is:", next_point_to_probe)
 
-    optimizer.maximize(init_points=0, n_iter=20)
+    # optimizer.maximize(init_points=0, n_iter=20)
 
 
 if __name__ == "__main__":
-
     args = parser.parse_args()
+
+    ray.init()
 
     if args.num_gpus > 0:
         assert tf.test.is_gpu_available(), "Requested GPUs but none found."
@@ -792,10 +795,10 @@ if __name__ == "__main__":
         )
     if (args.num_layers - 2) % 6 != 0:
         raise ValueError("Invalid --num-layers parameter.")
-    if args.num_gpus != 0 and args.train_batch_size % args.num_gpus != 0:
-        raise ValueError("--train-batch-size must be multiple of --num-gpus.")
-    if args.num_gpus != 0 and args.eval_batch_size % args.num_gpus != 0:
-        raise ValueError("--eval-batch-size must be multiple of --num-gpus.")
+    # if args.num_gpus != 0 and args.train_batch_size % args.num_gpus != 0:
+    #     raise ValueError("--train-batch-size must be multiple of --num-gpus.")
+    # if args.num_gpus != 0 and args.eval_batch_size % args.num_gpus != 0:
+    #     raise ValueError("--eval-batch-size must be multiple of --num-gpus.")
 
     main(**vars(args))
 
