@@ -9,6 +9,7 @@ from .util import UtilityFunction, acq_max, ensure_rng
 from sklearn.gaussian_process.kernels import Matern
 from sklearn.gaussian_process import GaussianProcessRegressor
 
+import collections
 
 class Matern2(Matern):
     def __init__(
@@ -26,20 +27,27 @@ class Matern2(Matern):
         self.m = Matern(nu=nu)
 
     def __call__(self, X, Y=None, eval_gradient=False):
-        category = {}
-        for x in X:
-            for i in range(len(x)):
-                if self.discrete[i] == 1:
-                    x[i] = round(x[i])
-                elif self.categorical[i] == 1:
-                    category[i] = x[i]
+        # TODO: support multiple categories
+        categories = collections.defaultdict(dict)
+
+        for i in range(len(X)):
+            x = X[i]
+            for j in range(len(x)):
+                if self.discrete[j] == 1:
+                    x[j] = round(x[j])
+                elif self.categorical[j] == 1:
+                    categories[i][j] = x[j]
         # One-hot encode category
-        key_max = max(category.keys(), key=(lambda k: category[k]))
-        for i in category.keys():
-            if i != key_max:
-                x[i] = 0
-            else:
-                x[i] = 1
+        if len(categories) > 0:
+            for i in range(len(categories)):
+                category = categories[i]
+                key_max = max(category.keys(), key=(lambda k: category[k]))
+                for j in category.keys():
+                    if j != key_max:
+                        X[i][j] = 0
+                    else:
+                        X[i][j] = 1
+
         return self.m(X, Y, eval_gradient)
 
 
