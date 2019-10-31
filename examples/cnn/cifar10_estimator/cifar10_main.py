@@ -228,7 +228,7 @@ parser.add_argument(
 parser.add_argument(
     "--ray-address",
     type=str,
-    default="localhost:6379",
+    default="",
     help="""
     """,
 )
@@ -807,7 +807,7 @@ def main():
 
 if __name__ == "__main__":
 
-    ray.init(redis_address="147.46.216.202:42463")
+    ray.init(redis_address=args.ray_address)
 
     if args.num_gpus > 0:
         assert tf.test.is_gpu_available(), "Requested GPUs but none found."
