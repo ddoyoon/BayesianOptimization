@@ -29,6 +29,7 @@ from __future__ import division
 from __future__ import print_function
 
 import argparse
+import datetime
 import functools
 import itertools
 import os
@@ -48,7 +49,7 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
 import ray
-from ray.tune import run
+from ray.tune import run, Trainable
 from ray.tune.schedulers import AsyncHyperBandScheduler
 from ray.tune.suggest.bayesopt import BayesOptSearch
 
@@ -105,6 +106,12 @@ parser.add_argument(
     type=int,
     default=100,
     help="Batch size for validation.",
+)
+parser.add_argument(
+    "--num-batches-for-eval",
+    type=int,
+    default=10,
+    help="Number of batches for validation.",
 )
 # parser.add_argument(
 #     "--momentum",
@@ -192,10 +199,10 @@ parser.add_argument(
 # Add arguments related to BayesOpt
 
 parser.add_argument(
-    "--test",
+    "--smoke-test",
     action="store_true",
     default=False,
-    help="Whether to test run with few epochs.",
+    help="Finish quickly for testing",
 )
 
 # parser.add_argument(
@@ -225,6 +232,14 @@ parser.add_argument(
     help="""
     """,
 )
+args = parser.parse_args()
+# Filling in shared values here
+hparams = {}
+hparams["num_layers"] = args.num_layers
+hparams["eval_batch_size"] = args.eval_batch_size
+hparams["sync"] = args.sync
+hparams["num_inter_threads"] = args.num_inter_threads
+hparams["data_format"] = args.data_format
 
 
 def get_model_fn(num_gpus, variable_strategy, num_workers):
@@ -516,13 +531,14 @@ def input_fn(
         return feature_shards, label_shards
 
 
-def run_experiment(
+def build_estimator(
     data_dir,
     num_gpus,
     variable_strategy,
     run_config,
     hparams,
     use_distortion_for_training=True,
+    ws=None,
 ):
     """Returns an Experiment function.
 
@@ -571,30 +587,16 @@ def run_experiment(
             "validation set size must be multiple of eval_batch_size"
         )
 
-    train_steps = hparams.train_steps
-    eval_steps = num_eval_examples // hparams.eval_batch_size
-
     classifier = tf.estimator.Estimator(
         model_fn=get_model_fn(
             num_gpus, variable_strategy, run_config.num_worker_replicas or 1
         ),
         config=run_config,
         params=hparams,
+        warm_start_from=ws,
     )
 
-    # Create experiment.
-    train_spec = tf.estimator.TrainSpec(
-        input_fn=train_input_fn, max_steps=train_steps
-    )
-    eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps)
-    # return tf.contrib.learn.Experiment(
-    #     classifier,
-    #     train_input_fn=train_input_fn,
-    #     eval_input_fn=eval_input_fn,
-    #     train_steps=train_steps,
-    #     eval_steps=eval_steps,
-    # )
-    return tf.estimator.train_and_evaluate(classifier, train_spec, eval_spec)
+    return train_input_fn, eval_input_fn, classifier
 
 
 def get_idx(pbounds, names):
@@ -609,30 +611,23 @@ def get_idx(pbounds, names):
     return param_list
 
 
-# TODO: categorical 로 overlap 보기보다 discrete 로 여러가지 hp 보는 것으로, elsa 6, 8, 10
-def main(
-    strategy,
-    test,
-    metric,
-    job_dir,
-    data_dir,
-    num_gpus,
-    variable_strategy,
-    use_distortion_for_training,
-    log_device_placement,
-    num_intra_threads,
-    **hparams,
-):
-    def discretize_train(config, reporter):
-        """Wrapper for handling discrete or categorical variables.
-        The suggested values to try are casted and calculated here and passed to the actual training routine.
+class MyTrainableEstimator(Trainable):
+    def _setup(self, config):
 
-        Discrete parameters (suggested as float) are cast to int.
-        Categorical parameters (suggested as a group of one-hot encoded values) are selected according to
-        which category corresponds to 1.
+        # The env variable is on deprecation path, default is set to off.
+        os.environ["TF_SYNC_ON_FINISH"] = "0"
+        os.environ["TF_ENABLE_WINOGRAD_NONFUSED"] = "1"
 
-        Returns the metric returned by the training routine to use as feedback to Bayesian Optimization.
-        """
+        # Session configuration.
+        sess_config = tf.ConfigProto(
+            allow_soft_placement=True,
+            log_device_placement=args.log_device_placement,
+            intra_op_parallelism_threads=args.num_intra_threads,
+            gpu_options=tf.GPUOptions(
+                force_gpu_compatible=True, allow_growth=True
+            ),
+        )
+
         # Convert to actual hyperparameter values here using the grid (discrete) input
         hparams["train_batch_size"] = 28 + int(config["batch_size"])
         hparams["momentum"] = 0.4 + (0.55 * config["momentum"] / 100)
@@ -645,63 +640,94 @@ def main(
         )
         hparams["learning_rate"] = 0.01 + (0.1 * config["learning_rate"] / 100)
 
-        # print(config)
         # print(hparams)
 
-        # Create separate directory for each trial
-        hp = [
-            config["batch_size"],
-            config["momentum"],
-            config["weight_decay"],
-            config["batch_norm_decay"],
-            config["batch_norm_epsilon"],
-            config["learning_rate"],
-        ]
-        hp_id = "-".join(map(str, hp))
-        config = cifar10_utils.RunConfig(
+        # if self.config['exp'] in self.logdir:
+        #     self.model_dir = self.logdir.split(self.config['exp'])[0] + self.config['exp']
+        # else:
+        #     raise IndexError(self.logdir + ' does not contain splitter ' + self.config['exp'] + 'check configuration '
+        #                                                                                         'logdir path and exp '
+        #                                                                                         'file')
+        # self.model_dir_full = self.model_dir + '/' + datetime.datetime.now().strftime("%d_%b_%Y_%I_%M_%S_%f%p")
+
+        # Calculate number of steps per one epoch
+        self.train_steps = cifar10.Cifar10DataSet.num_examples_per_epoch(
+            "train"
+        ) // (hparams["train_batch_size"])
+
+        # TODO: fix checkpoint dir
+        run_config = cifar10_utils.RunConfig(
             session_config=sess_config,
-            model_dir=None
-            # session_config=sess_config, model_dir=job_dir + "/" + hp_id
+            model_dir=None,
+            save_checkpoints_secs=None,
+            save_checkpoints_steps=self.train_steps,
+            keep_checkpoint_max=None,
+            keep_checkpoint_every_n_hours=None,
         )
+        self.run_config = run_config
 
-        # res: A tuple of the result of the evaluate call to the Estimator and the export results using the specified ExportStrategy
-        # e.g. ({'accuracy': 0.1189, 'loss': 2.4768918, 'global_step': 100}, [])
-        # Currently, the return value is undefined for distributed training mode
-
-        res = run_experiment(
-            data_dir=data_dir,
-            num_gpus=num_gpus,
-            variable_strategy=variable_strategy,
-            use_distortion_for_training=use_distortion_for_training,
-            run_config=config,
+        self.train_input_fn, self.eval_input_fn, self.estimator = build_estimator(
+            data_dir=args.data_dir,
+            num_gpus=args.num_gpus,
+            variable_strategy=args.variable_strategy,
+            use_distortion_for_training=args.use_distortion_for_training,
+            run_config=run_config,
             hparams=tf.contrib.training.HParams(
-                is_chief=config.is_chief, **hparams
+                is_chief=run_config.is_chief, **hparams
             ),
         )
 
-        if metric == "accuracy":
-            reporter(done=1, train_acc=res[0]["accuracy"])
-        elif metric == "loss":
-            # Bayesian Optimization seeks to maximize, so return negative of loss
-            return -res[0]["loss"]
+        self.steps = 0
 
-    # The env variable is on deprecation path, default is set to off.
-    os.environ["TF_SYNC_ON_FINISH"] = "0"
-    os.environ["TF_ENABLE_WINOGRAD_NONFUSED"] = "1"
+    def _train(self):
+        self.estimator.train(
+            input_fn=self.train_input_fn, max_steps=self.train_steps
+        )
+        metrics = self.estimator.evaluate(
+            input_fn=self.eval_input_fn,
+            steps=args.eval_batch_size * args.num_batches_for_eval,
+        )
+        self.steps = self.steps + self.train_steps
+        return metrics
 
-    # Session configuration.
-    sess_config = tf.ConfigProto(
-        allow_soft_placement=True,
-        log_device_placement=log_device_placement,
-        intra_op_parallelism_threads=num_intra_threads,
-        gpu_options=tf.GPUOptions(
-            force_gpu_compatible=True, allow_growth=True
-        ),
-    )
+    def _stop(self):
+        self.estimator = None
 
-    if test:
-        print("Testing with 100 steps")
-        hparams["train_steps"] = 100
+    def _save(self, checkpoint_dir):
+        lastest_checkpoint = self.estimator.latest_checkpoint()
+        tf.logging.info(
+            "Saving checkpoint {} for tune".format(lastest_checkpoint)
+        )
+        f = open(checkpoint_dir + "/path.txt", "w")
+        f.write(lastest_checkpoint)
+        f.flush()
+        f.close()
+        return checkpoint_dir + "/path.txt"
+
+    def _restore(self, checkpoint_path):
+        f = open(checkpoint_path, "r")
+        path = f.readline().strip()
+        tf.logging.info("Opening checkpoint {} for tune".format(path))
+        f.flush()
+        f.close()
+
+        ws = tf.estimator.WarmStartSettings(ckpt_to_initialize_from=path)
+        self.train_input_fn, self.eval_input_fn, self.estimator = build_estimator(
+            data_dir=args.data_dir,
+            num_gpus=args.num_gpus,
+            variable_strategy=args.variable_strategy,
+            use_distortion_for_training=args.use_distortion_for_training,
+            run_config=self.run_config,
+            hparams=tf.contrib.training.HParams(
+                is_chief=self.run_config.is_chief, **hparams
+            ),
+            warm_start_from=ws,
+        )
+
+
+# TODO: categorical 로 overlap 보기보다 discrete 로 여러가지 hp 보는 것으로, elsa 6, 8, 10
+def main():
+    # print(args)
 
     # Minor hack of generating a grid of 100 values each.
     # By setting all parameters to be discrete values over range (0,100),
@@ -729,19 +755,27 @@ def main(
     discrete_indices = get_idx(pbounds, discrete)
     categorical_indices = get_idx(pbounds, categorical)
 
-    config = {
-        "num_samples": 10,
-        "config": {"iterations": 100},
-        "stop": {"done": 1},
+    train_spec = {
+        "resources_per_trial": {"cpu": 12, "gpu": 1},
+        "stop": {
+            "accuracy": 99,
+            "training_iteration": 1 if args.smoke_test else 99999,
+        },
+        "config": {
+            "exp": "ckpt"  # the name of directory where training results are saved
+        },
+        "num_samples": 100,
+        "local_dir": "/home/ddoyoon/BayesianOptimization/examples/cnn/cifar10_estimator/ckpt",
+        "checkpoint_at_end": True,
     }
 
     algo = BayesOptSearch(
-        strategy,
+        args.strategy,
         pbounds,
         discrete=discrete_indices,
         categorical=categorical_indices,
-        max_concurrent=1,
-        metric="train_acc",
+        max_concurrent=12,
+        metric="accuracy",
         mode="max",
         utility_kwargs={"kind": "ucb", "kappa": 2.5, "xi": 0.0},
     )
@@ -760,27 +794,20 @@ def main(
     #     lazy=True,
     # )
 
-    scheduler = AsyncHyperBandScheduler(metric="train_acc", mode="max")
+    scheduler = AsyncHyperBandScheduler(metric="accuracy", mode="max")
+
     run(
-        discretize_train,
-        name="my_exp",
+        MyTrainableEstimator,
+        name="bo_resnet_cifar10",
         search_alg=algo,
         scheduler=scheduler,
-        resources_per_trial={"cpu": 12, "gpu": 1},
-        **config,
+        **train_spec,
     )
-
-    # utility = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
-    # next_point_to_probe = optimizer.suggest(utility)
-    # print("Next point to probe is:", next_point_to_probe)
-
-    # optimizer.maximize(init_points=0, n_iter=20)
 
 
 if __name__ == "__main__":
-    args = parser.parse_args()
 
-    ray.init()
+    ray.init(redis_address="147.46.216.202:42463")
 
     if args.num_gpus > 0:
         assert tf.test.is_gpu_available(), "Requested GPUs but none found."
@@ -795,10 +822,6 @@ if __name__ == "__main__":
         )
     if (args.num_layers - 2) % 6 != 0:
         raise ValueError("Invalid --num-layers parameter.")
-    # if args.num_gpus != 0 and args.train_batch_size % args.num_gpus != 0:
-    #     raise ValueError("--train-batch-size must be multiple of --num-gpus.")
-    # if args.num_gpus != 0 and args.eval_batch_size % args.num_gpus != 0:
-    #     raise ValueError("--eval-batch-size must be multiple of --num-gpus.")
 
-    main(**vars(args))
+    main()
 
