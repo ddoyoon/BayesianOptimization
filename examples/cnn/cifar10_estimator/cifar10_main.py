@@ -47,15 +47,19 @@ import six
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
 import tensorflow as tf
+# import tensorflow_addons as tfa
+
+# Setting verbosity to INFO will log training and evaluation details.
+tf.logging.set_verbosity(tf.logging.ERROR)
 
 import ray
 from ray.tune import run, Trainable
 from ray.tune.schedulers import AsyncHyperBandScheduler
 from ray.tune.suggest.bayesopt import BayesOptSearch
 
-logging = tf.logging
-# Setting verbosity to INFO will log training and evaluation details.
-logging.set_verbosity(tf.logging.ERROR)
+import logging
+
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -104,7 +108,7 @@ parser.add_argument(
 parser.add_argument(
     "--eval-batch-size",
     type=int,
-    default=100,
+    default=500,
     help="Batch size for validation.",
 )
 parser.add_argument(
@@ -204,18 +208,15 @@ parser.add_argument(
     default=False,
     help="Finish quickly for testing",
 )
-
 # parser.add_argument(
 #     "--verbose", type=bool, default=False, help="Verbose output of training."
 # )
-
 parser.add_argument(
     "--strategy",
     type=str,
     default="proposed",
     help="Strategy for discretizing. Possible options are: basic, proposed.",
 )
-
 parser.add_argument(
     "--metric",
     type=str,
@@ -224,7 +225,22 @@ parser.add_argument(
     Whether to use accuracy or loss for Bayesian optimization.\
     """,
 )
-
+# TODO: better name?
+parser.add_argument(
+    "--precision",
+    type=int,
+    default=1000,
+    help="""\
+    Size of grid\
+    """,
+)
+parser.add_argument(
+    "--log-path",
+    type=str,
+    default=os.getcwd() + "/train.log",
+    help="""
+    """,
+)
 parser.add_argument(
     "--ray-address",
     type=str,
@@ -233,6 +249,7 @@ parser.add_argument(
     """,
 )
 args = parser.parse_args()
+
 # Filling in shared values here
 hparams = {}
 hparams["num_layers"] = args.num_layers
@@ -362,10 +379,10 @@ def get_model_fn(num_gpus, variable_strategy, num_workers):
             )
             boundaries = [
                 num_batches_per_epoch * x
-                for x in np.array([82, 123, 300], dtype=np.int64)
+                for x in np.array([80, 120, 160], dtype=np.int64)
             ]
             staged_lr = [
-                params.learning_rate * x for x in [1, 0.1, 0.01, 0.002]
+                params.learning_rate * x for x in [1, 0.1, 0.01, 0.001]
             ]
 
             learning_rate = tf.train.piecewise_constant(
@@ -374,22 +391,48 @@ def get_model_fn(num_gpus, variable_strategy, num_workers):
 
             loss = tf.reduce_mean(tower_losses, name="loss")
 
-            examples_sec_hook = cifar10_utils.ExamplesPerSecondHook(
-                params.train_batch_size, every_n_steps=10
-            )
+            # examples_sec_hook = cifar10_utils.ExamplesPerSecondHook(
+            #     params.train_batch_size, every_n_steps=10
+            # )
 
-            tensors_to_log = {"learning_rate": learning_rate, "loss": loss}
+            # tensors_to_log = {"learning_rate": learning_rate, "loss": loss}
 
-            logging_hook = tf.train.LoggingTensorHook(
-                tensors=tensors_to_log, every_n_iter=100
-            )
+            # logging_hook = tf.train.LoggingTensorHook(
+            #     tensors=tensors_to_log, every_n_iter=100
+            # )
 
-            train_hooks = [logging_hook, examples_sec_hook]
-            # train_hooks = []
+            # train_hooks = [logging_hook, examples_sec_hook]
+            train_hooks = []
 
-            optimizer = tf.train.MomentumOptimizer(
-                learning_rate=learning_rate, momentum=momentum
-            )
+            # Hyper-parameter "momentum" is only used for the Momentum Optimizer
+            # Other optimizers use their default parameters.
+            if params.optimizer == "momentum":
+                optimizer = tf.train.MomentumOptimizer(
+                    learning_rate=learning_rate, momentum=momentum
+                )
+            elif params.optimizer == "adam":
+                optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+            elif params.optimizer == "adagrad":
+                optimizer = tf.train.AdagradOptimizer(
+                    learning_rate=learning_rate
+                )
+            elif params.optimizer == "adadelta":
+                optimizer = tf.train.AdadeltaOptimizer(
+                    learning_rate=learning_rate
+                )
+            elif params.optimizer == "sgd":
+                optimizer = tf.train.GradientDescentOptimizer(
+                    learning_rate=learning_rate
+                )
+            elif params.optimizer == "rmsprop":
+                optimizer = tf.train.RMSPropOptimizer(
+                    learning_rate=learning_rate
+                )
+            else:
+                raise ValueError("unrecognized optimizer name")
+            # TODO: RAdam is implemented in tensorflow-addons v0.6, which requires tf 2.0
+            #       Upgrade code by removing tf.contrib modules.
+            # optimizer = tfa.optimizers.RectifiedAdam(lr=learning_rate)
 
             if params.sync:
                 optimizer = tf.train.SyncReplicasOptimizer(
@@ -498,7 +541,7 @@ def input_fn(
 
     Args:
         data_dir: Directory where TFRecords representing the dataset are located.
-        subset: one of 'train', 'validate' and 'eval'.
+        subset: one of 'train', 'validation' and 'eval'.
         num_shards: num of towers participating in data-parallel training.
         batch_size: total batch size for training to be divided by the number of
         shards.
@@ -576,12 +619,16 @@ def build_estimator(
     eval_input_fn = functools.partial(
         input_fn,
         data_dir,
-        subset="eval",
+        subset="validation",
         batch_size=hparams.eval_batch_size,
         num_shards=num_gpus,
     )
 
-    num_eval_examples = cifar10.Cifar10DataSet.num_examples_per_epoch("eval")
+    # validation: 5000, eval:10000
+    num_eval_examples = cifar10.Cifar10DataSet.num_examples_per_epoch(
+        "validation"
+    )
+
     if num_eval_examples % hparams.eval_batch_size != 0:
         raise ValueError(
             "validation set size must be multiple of eval_batch_size"
@@ -629,33 +676,42 @@ class MyTrainableEstimator(Trainable):
         )
 
         # Convert to actual hyperparameter values here using the grid (discrete) input
-        hparams["train_batch_size"] = 28 + int(config["batch_size"])
-        hparams["momentum"] = 0.4 + (0.55 * config["momentum"] / 100)
-        hparams["weight_decay"] = 1e-4 + (1e-4 * config["weight_decay"] / 100)
+        hparams["train_batch_size"] = 2 ** (int(config["batch_size"]) + 5)
+        hparams["momentum"] = 0.4 + (
+            0.55 * int(config["momentum"]) / args.precision
+        )
+        hparams["weight_decay"] = 1e-4 + (
+            1e-4 * int(config["weight_decay"]) / args.precision
+        )
         hparams["batch_norm_decay"] = 0.8 + (
-            0.199 * config["batch_norm_decay"] / 100
+            0.199 * int(config["batch_norm_decay"]) / args.precision
         )
         hparams["batch_norm_epsilon"] = 1e-5 + (
-            0.00099 * config["batch_norm_epsilon"] / 100
+            0.00099 * int(config["batch_norm_epsilon"]) / args.precision
         )
-        hparams["learning_rate"] = 0.01 + (0.1 * config["learning_rate"] / 100)
-
-        # print(hparams)
-
-        # if self.config['exp'] in self.logdir:
-        #     self.model_dir = self.logdir.split(self.config['exp'])[0] + self.config['exp']
-        # else:
-        #     raise IndexError(self.logdir + ' does not contain splitter ' + self.config['exp'] + 'check configuration '
-        #                                                                                         'logdir path and exp '
-        #                                                                                         'file')
-        # self.model_dir_full = self.model_dir + '/' + datetime.datetime.now().strftime("%d_%b_%Y_%I_%M_%S_%f%p")
+        hparams["learning_rate"] = 0.01 + (
+            0.1 * int(config["learning_rate"]) / args.precision
+        )
+        opt = int(config["optimizer"])
+        if opt == 0:
+            hparams["optimizer"] = "momentum"
+        elif opt == 1:
+            hparams["optimizer"] = "adam"
+        elif opt == 2:
+            hparams["optimizer"] = "adagrad"
+        elif opt == 3:
+            hparams["optimizer"] = "adadelta"
+        elif opt == 4:
+            hparams["optimizer"] = "sgd"
+        else:
+            hparams["optimizer"] = "rmsprop"
 
         # Calculate number of steps per one epoch
         self.train_steps = cifar10.Cifar10DataSet.num_examples_per_epoch(
             "train"
         ) // (hparams["train_batch_size"])
 
-        # TODO: fix checkpoint dir
+        # TODO: Fix checkpoint dir
         run_config = cifar10_utils.RunConfig(
             session_config=sess_config,
             model_dir=None,
@@ -677,17 +733,26 @@ class MyTrainableEstimator(Trainable):
             ),
         )
 
-        self.steps = 0
+        self.logger = logging.getLogger("metrics")
+        self.logger.setLevel(logging.INFO)
+        file_handler = logging.FileHandler(args.log_path)
+        self.logger.addHandler(file_handler)
+
+        self.logger.info(f"[CONFIG] ID={self._experiment_id} config={hparams}")
+        # self.steps = self.train_steps
 
     def _train(self):
         self.estimator.train(
-            input_fn=self.train_input_fn, max_steps=self.train_steps
+            input_fn=self.train_input_fn, steps=self.train_steps
         )
         metrics = self.estimator.evaluate(
             input_fn=self.eval_input_fn,
             steps=args.eval_batch_size * args.num_batches_for_eval,
         )
-        self.steps = self.steps + self.train_steps
+        # self.steps = self.steps + self.train_steps
+        self.logger.info(
+            f"[RESULT] ID={self._experiment_id} iter={self._iteration} result={metrics}"
+        )
         return metrics
 
     def _stop(self):
@@ -725,7 +790,6 @@ class MyTrainableEstimator(Trainable):
         )
 
 
-# TODO: categorical 로 overlap 보기보다 discrete 로 여러가지 hp 보는 것으로, elsa 6, 8, 10
 def main():
     # print(args)
 
@@ -733,12 +797,13 @@ def main():
     # By setting all parameters to be discrete values over range (0,100),
     # we can map each integer value to corresponding hyperparameter value in training code.
     pbounds = {
-        "batch_size": (0, 100),
-        "momentum": (0, 100),
-        "weight_decay": (0, 100),
-        "batch_norm_decay": (0, 100),
-        "batch_norm_epsilon": (0, 100),
-        "learning_rate": (0, 100),
+        "batch_size": (0, 6),
+        "momentum": (0, args.precision),
+        "weight_decay": (0, args.precision),
+        "batch_norm_decay": (0, args.precision),
+        "batch_norm_epsilon": (0, args.precision),
+        "learning_rate": (0, args.precision),
+        "optimizer": (0, 6),
     }
 
     discrete = [
@@ -748,6 +813,7 @@ def main():
         "batch_norm_decay",
         "batch_norm_epsilon",
         "learning_rate",
+        "optimizer",
     ]
 
     categorical = []
@@ -758,13 +824,14 @@ def main():
     train_spec = {
         "resources_per_trial": {"cpu": 12, "gpu": 1},
         "stop": {
-            "accuracy": 99,
-            "training_iteration": 1 if args.smoke_test else 99999,
+            "accuracy": 93,
+            "training_iteration": 2 if args.smoke_test else 99999,
         },
         "config": {
-            "exp": "ckpt"  # the name of directory where training results are saved
+            "exp": "ckpt",  # the name of directory where training results are saved
+            "log_level": "ERROR",
         },
-        "num_samples": 100,
+        "num_samples": 100000,
         "local_dir": "/home/ddoyoon/BayesianOptimization/examples/cnn/cifar10_estimator/ckpt",
         "checkpoint_at_end": True,
     }
@@ -794,7 +861,20 @@ def main():
     #     lazy=True,
     # )
 
-    scheduler = AsyncHyperBandScheduler(metric="accuracy", mode="max")
+    scheduler = AsyncHyperBandScheduler(
+        metric="accuracy",
+        mode="max",
+        max_t=200,
+        grace_period=20,
+        reduction_factor=2,
+    )
+
+    experiment_start = datetime.datetime.utcnow()
+    logger = logging.getLogger("metrics")
+    logger.setLevel(logging.INFO)
+    file_handler = logging.FileHandler(args.log_path)
+    logger.addHandler(file_handler)
+    logger.info(f"[ TIME ] start={experiment_start}")
 
     run(
         MyTrainableEstimator,
@@ -804,10 +884,20 @@ def main():
         **train_spec,
     )
 
+    experiment_end = datetime.datetime.utcnow()
+    experiment_duration = experiment_end - experiment_start
+    logger.info(f"[ TIME ] end={experiment_end}")
+    logger.info(
+        f"[ TIME ] end-to-end (min)={experiment_duration.total_seconds() / 60}"
+    )
+
 
 if __name__ == "__main__":
 
-    ray.init(redis_address=args.ray_address)
+    if args.ray_address != "":
+        ray.init(redis_address=args.ray_address, logging_level=logging.ERROR)
+    else:
+        ray.init()
 
     if args.num_gpus > 0:
         assert tf.test.is_gpu_available(), "Requested GPUs but none found."
