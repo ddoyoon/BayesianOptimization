@@ -240,7 +240,7 @@ class BayesianOptimization(Observable):
                 iteration += 1
 
             self.probe(x_probe, lazy=False)
-
+        self.util = util
         self.dispatch(Events.OPTMIZATION_END)
 
     def set_bounds(self, new_bounds):
