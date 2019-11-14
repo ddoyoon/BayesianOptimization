@@ -17,8 +17,8 @@ class Matern2(Matern):
         length_scale=1.0,
         length_scale_bounds=(1e-5, 1e5),
         nu=1.5,
-        discrete=None,
-        categorical=None,
+        discrete=[],
+        categorical=[],
     ):
         # print("Using custom kernel.")
         super().__init__(length_scale, length_scale_bounds, nu)
@@ -109,20 +109,22 @@ class Observable(object):
 class BayesianOptimization(Observable):
     def __init__(
         self,
-        strategy,
         f,
         pbounds,
         random_state=None,
+        strategy="proposed",
         verbose=2,
-        discrete=None,
-        categorical=None,
+        discrete=[],
+        categorical=[],
     ):
         """"""
         self._random_state = ensure_rng(random_state)
 
         # Data structure containing the function to be optimized, the bounds of
         # its domain, and a record of the evaluations we have done so far
-        self._space = TargetSpace(f, pbounds, random_state)
+        self._space = TargetSpace(f, pbounds, random_state, discrete, categorical)
+        self.discrete_idx = self._space.discrete_idx
+        self.categorical_idx = self._space.categorical_idx
 
         # queue
         self._queue = Queue()
@@ -139,7 +141,7 @@ class BayesianOptimization(Observable):
         elif strategy == "proposed":
             self._gp = GaussianProcessRegressor(
                 kernel=Matern2(
-                    nu=2.5, discrete=discrete, categorical=categorical
+                    nu=2.5, discrete=self.discrete_idx, categorical=self.categorical_idx
                 ),
                 alpha=1e-6,
                 normalize_y=True,
@@ -148,8 +150,6 @@ class BayesianOptimization(Observable):
             )
 
         self._verbose = verbose
-        self.discrete = discrete
-        self.categorical = categorical
         super(BayesianOptimization, self).__init__(events=DEFAULT_EVENTS)
 
     @property

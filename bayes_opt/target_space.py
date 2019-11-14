@@ -22,7 +22,15 @@ class TargetSpace(object):
     >>> y = space.register_point(x)
     >>> assert self.max_point()['max_val'] == y
     """
-    def __init__(self, target_func, pbounds, random_state=None):
+
+    def __init__(
+        self,
+        target_func,
+        pbounds,
+        random_state=None,
+        discrete=[],
+        categorical=[],
+    ):
         """
         Parameters
         ----------
@@ -46,8 +54,12 @@ class TargetSpace(object):
         # Create an array with parameters bounds
         self._bounds = np.array(
             [item[1] for item in sorted(pbounds.items(), key=lambda x: x[0])],
-            dtype=np.float
+            dtype=np.float,
         )
+        # parameters are now sorted and will be dealt with using indices
+        # calculate the indices of discrete/categorical parameters
+        self.discrete_idx = self.get_idx(self._keys, discrete)
+        self.categorical_idx = self.get_idx(self._keys, categorical)
 
         # preallocated memory for X and Y points
         self._params = np.empty(shape=(0, self.dim))
@@ -92,8 +104,8 @@ class TargetSpace(object):
             assert set(params) == set(self.keys)
         except AssertionError:
             raise ValueError(
-                "Parameters' keys ({}) do ".format(sorted(params)) +
-                "not match the expected set of keys ({}).".format(self.keys)
+                "Parameters' keys ({}) do ".format(sorted(params))
+                + "not match the expected set of keys ({}).".format(self.keys)
             )
         return np.asarray([params[key] for key in self.keys])
 
@@ -102,8 +114,8 @@ class TargetSpace(object):
             assert len(x) == len(self.keys)
         except AssertionError:
             raise ValueError(
-                "Size of array ({}) is different than the ".format(len(x)) +
-                "expected number of parameters ({}).".format(len(self.keys))
+                "Size of array ({}) is different than the ".format(len(x))
+                + "expected number of parameters ({}).".format(len(self.keys))
             )
         return dict(zip(self.keys, x))
 
@@ -118,8 +130,8 @@ class TargetSpace(object):
             assert x.size == self.dim
         except AssertionError:
             raise ValueError(
-                "Size of array ({}) is different than the ".format(len(x)) +
-                "expected number of parameters ({}).".format(len(self.keys))
+                "Size of array ({}) is different than the ".format(len(x))
+                + "expected number of parameters ({}).".format(len(self.keys))
             )
         return x
 
@@ -158,7 +170,7 @@ class TargetSpace(object):
         """
         x = self._as_array(params)
         if x in self:
-            raise KeyError('Data point {} is not unique'.format(x))
+            raise KeyError("Data point {} is not unique".format(x))
 
         # Insert data into unique dictionary
         self._cache[_hashable(x.ravel())] = target
@@ -216,16 +228,18 @@ class TargetSpace(object):
         data = np.empty((1, self.dim))
         for col, (lower, upper) in enumerate(self._bounds):
             data.T[col] = self.random_state.uniform(lower, upper, size=1)
+            if self.discrete_idx[col] == 1:
+                data.T[col] = int(data.T[col])
         return data.ravel()
 
     def max(self):
         """Get maximum target value found and corresponding parametes."""
         try:
             res = {
-                'target': self.target.max(),
-                'params': dict(
+                "target": self.target.max(),
+                "params": dict(
                     zip(self.keys, self.params[self.target.argmax()])
-                )
+                ),
             }
         except ValueError:
             res = {}
@@ -252,3 +266,18 @@ class TargetSpace(object):
         for row, key in enumerate(self.keys):
             if key in new_bounds:
                 self._bounds[row] = new_bounds[key]
+
+    def get_idx(self, param_names, names):
+        # param_names are sorted names of parameters
+        # Initially all parameters are not marked as discrete/categorical
+        param_list = [0] * len(param_names)
+
+        for i in range(len(param_names)):
+            if param_names[i] in names:
+                param_list[i] = 1
+
+        # Printing for sanity check!
+        # print(param_names)
+        # print(param_list)
+
+        return param_list
